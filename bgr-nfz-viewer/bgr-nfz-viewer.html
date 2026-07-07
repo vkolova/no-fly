@@ -1,0 +1,1729 @@
+<!DOCTYPE html>
+<html lang="bg" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BGR No-Fly Zones · 16-06-2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js">
+// ── CHECK-POINT MODE ─────────────────────────────────────────────────────────
+let checkMode = false;
+let checkMarker = null;
+let checkPopup = null;
+
+document.getElementById('check-btn').addEventListener('click', () => {
+  checkMode = !checkMode;
+  document.getElementById('check-btn').classList.toggle('active', checkMode);
+  document.body.classList.toggle('check-mode', checkMode);
+  if (!checkMode && checkMarker) {
+    checkMarker.remove(); checkMarker = null;
+    if (checkPopup) { checkPopup.remove(); checkPopup = null; }
+  }
+});
+
+// Override map click to support check mode
+const _origMapClick = map._events?.click;
+
+map.on('click', (e) => {
+  if (!checkMode) return; // handled by existing handler when not in check mode
+  placeCheckPoint(e.latlng);
+});
+
+// We need to patch the existing click handler to be mode-aware
+// Re-register: remove all, add smart one
+map.off('click');
+map.on('click', (e) => {
+  if (checkMode) {
+    placeCheckPoint(e.latlng);
+    return;
+  }
+  // original zone-picking logic
+  const point = e.latlng;
+  let best = null;
+  let bestArea = Infinity;
+  allZones.forEach(zone => {
+    if (!layerMap[zone.identifier]) return;
+    const layers = layerMap[zone.identifier].filter(l => layerGroup.hasLayer(l));
+    if (!layers.length) return;
+    if (!zoneContainsPoint(zone, point)) return;
+    const area = getZoneArea(zone);
+    if (area < bestArea) { bestArea = area; best = zone.identifier; }
+  });
+  if (best) { selectZone(best); } else { deselectZone(); }
+});
+
+function placeCheckPoint(latlng) {
+  // Remove old
+  if (checkMarker) { checkMarker.remove(); checkMarker = null; }
+  if (checkPopup) { checkPopup.remove(); checkPopup = null; }
+
+  // Pin marker
+  const icon = L.divIcon({
+    className: '',
+    html: '<div class="pin-marker"></div>',
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+  checkMarker = L.marker(latlng, { icon, zIndexOffset: 1000 }).addTo(map);
+
+  // Find zones containing point
+  const hits = [];
+  allZones.forEach(zone => {
+    if (!zoneContainsPoint(zone, latlng)) return;
+    // Only visible (filtered)
+    const layers = (layerMap[zone.identifier] || []).filter(l => layerGroup.hasLayer(l));
+    if (!layers.length) return;
+    hits.push(zone);
+  });
+
+  // Sort by area ascending (smallest first)
+  hits.sort((a, b) => getZoneArea(a) - getZoneArea(b));
+
+  // Build popup HTML
+  const lat = latlng.lat.toFixed(6);
+  const lng = latlng.lng.toFixed(6);
+  let inner = `<div class="popup-inner">`;
+  inner += `<div class="popup-coords">${lat}°N, ${lng}°E</div>`;
+
+  if (hits.length === 0) {
+    inner += `<div class="popup-none">✓ Без ограничения</div>`;
+  } else {
+    inner += `<div class="popup-title">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+        <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+      </svg>
+      ${hits.length} зона${hits.length !== 1 ? 'и' : ''}</div>`;
+    hits.forEach(zone => {
+      const colors = { PROHIBITED:'var(--zone-prohibited)', REQ_AUTHORISATION:'var(--zone-req-auth)', CONDITIONAL:'var(--zone-conditional)' };
+      const col = colors[zone.restriction] || 'var(--color-text-muted)';
+      const geo = (zone.geometry||[])[0]?.horizontalProjection;
+      const geoStr = geo?.type === 'Circle' ? `R=${geo.radius}m` : 'Полигон';
+      inner += `<div class="popup-zone-row" data-zone-id="${zone.identifier}">
+        <span style="width:8px;height:8px;border-radius:50%;background:${col};flex-shrink:0;display:inline-block"></span>
+        <div>
+          <div class="popup-zone-name">${zone.name}</div>
+          <div class="popup-zone-sub">${RESTRICTION_LABELS[zone.restriction]||zone.restriction} · ${geoStr}</div>
+        </div>
+      </div>`;
+    });
+  }
+  inner += `</div>`;
+
+  checkPopup = L.popup({
+    className: 'check-popup',
+    closeButton: true,
+    autoClose: false,
+    closeOnClick: false,
+    offset: [8, -4],
+    maxWidth: 320,
+  })
+  .setLatLng(latlng)
+  .setContent(inner)
+  .addTo(map);
+
+  // Bind click on zone rows after popup opens
+  checkPopup.on('add', () => {
+    document.querySelectorAll('.popup-zone-row[data-zone-id]').forEach(row => {
+      row.addEventListener('click', () => {
+        const id = row.dataset.zoneId;
+        if (id) {
+          checkMode = false;
+          document.getElementById('check-btn').classList.remove('active');
+          document.body.classList.remove('check-mode');
+          selectZone(id);
+          checkPopup.remove(); checkPopup = null;
+          checkMarker.remove(); checkMarker = null;
+        }
+      });
+    });
+  });
+}
+
+// ── GEOCODER ─────────────────────────────────────────────────────────────────
+let geoDebounce;
+let geoMarker = null;
+
+const geocoderInput = document.getElementById('geocoder');
+const geoResults = document.getElementById('geo-results');
+const geoSpinner = document.getElementById('geo-spinner');
+
+geocoderInput.addEventListener('input', () => {
+  clearTimeout(geoDebounce);
+  const q = geocoderInput.value.trim();
+  if (q.length < 3) { geoResults.classList.remove('open'); return; }
+  geoDebounce = setTimeout(() => geocodeSearch(q), 350);
+});
+
+geocoderInput.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { geoResults.classList.remove('open'); geocoderInput.blur(); }
+});
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#geo-wrap')) geoResults.classList.remove('open');
+});
+
+async function geocodeSearch(query) {
+  geoSpinner.classList.add('active');
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=6&countrycodes=bg&accept-language=bg`;
+    const res = await fetch(url, { headers: { 'Accept-Language': 'bg' } });
+    const data = await res.json();
+    renderGeoResults(data);
+  } catch {
+    geoResults.innerHTML = '<div class="geo-result"><div class="geo-result-name" style="color:var(--color-text-muted)">Грешка при търсене</div></div>';
+    geoResults.classList.add('open');
+  }
+  geoSpinner.classList.remove('active');
+}
+
+function renderGeoResults(data) {
+  geoResults.innerHTML = '';
+  if (!data.length) {
+    geoResults.innerHTML = '<div class="geo-result"><div class="geo-result-name" style="color:var(--color-text-muted)">Няма резултати</div></div>';
+    geoResults.classList.add('open');
+    return;
+  }
+  data.forEach(item => {
+    const div = document.createElement('div');
+    div.className = 'geo-result';
+    const parts = item.display_name.split(',');
+    const name = parts[0].trim();
+    const sub = parts.slice(1, 3).join(',').trim();
+    div.innerHTML = `<div class="geo-result-name">${escapeHtml(name)}</div>
+      <div class="geo-result-sub">${escapeHtml(sub)}</div>`;
+    div.addEventListener('click', () => {
+      geoResults.classList.remove('open');
+      geocoderInput.value = name;
+      flyToGeoResult(item);
+    });
+    geoResults.appendChild(div);
+  });
+  geoResults.classList.add('open');
+}
+
+function flyToGeoResult(item) {
+  const lat = parseFloat(item.lat);
+  const lng = parseFloat(item.lon);
+  const bb = item.boundingbox;
+
+  // Remove old geo marker
+  if (geoMarker) { geoMarker.remove(); geoMarker = null; }
+
+  // Place marker
+  const icon = L.divIcon({
+    className: '',
+    html: `<div style="width:0;height:0;position:relative">
+      <div style="position:absolute;width:16px;height:16px;background:var(--color-primary);
+        border:2.5px solid #fff;border-radius:50%;top:-8px;left:-8px;
+        box-shadow:0 1px 8px rgba(0,0,0,.5)"></div>
+    </div>`,
+    iconSize: [0, 0], iconAnchor: [0, 0],
+  });
+  geoMarker = L.marker([lat, lng], { icon, zIndexOffset: 2000 }).addTo(map);
+
+  // Fly to bounding box or just zoom to point
+  if (bb) {
+    map.fitBounds([[parseFloat(bb[0]), parseFloat(bb[2])],[parseFloat(bb[1]), parseFloat(bb[3])]],
+      { padding: [40, 40], maxZoom: 15 });
+  } else {
+    map.setView([lat, lng], 14);
+  }
+
+  // Check zones at this point
+  const latlng = L.latLng(lat, lng);
+  const hits = allZones.filter(z =>
+    (layerMap[z.identifier]||[]).some(l => layerGroup.hasLayer(l)) &&
+    zoneContainsPoint(z, latlng)
+  );
+  if (hits.length) {
+    showToast(`${item.display_name.split(',')[0]} · ${hits.length} зона${hits.length!==1?'и':''} ⚠`);
+  } else {
+    showToast(`${item.display_name.split(',')[0]} · Без ограничения`);
+  }
+}
+
+</script>
+<style>
+/* ─── TOKENS ─── */
+:root,[data-theme="light"]{
+  --color-bg:#f7f6f2;--color-surface:#f9f8f5;--color-surface-2:#fbfbf9;
+  --color-surface-offset:#f3f0ec;--color-surface-dynamic:#e6e4df;
+  --color-divider:#dcd9d5;--color-border:#d4d1ca;
+  --color-text:#28251d;--color-text-muted:#7a7974;--color-text-faint:#bab9b4;
+  --color-text-inverse:#f9f8f4;
+  --color-primary:#01696f;--color-primary-hover:#0c4e54;
+  --color-primary-highlight:#cedcd8;
+  --color-shadow: oklch(0.2 0.01 80 / 0.10);
+  --radius-sm:.375rem;--radius-md:.5rem;--radius-lg:.75rem;--radius-xl:1rem;--radius-full:9999px;
+  --font-body:'Inter','Helvetica Neue',sans-serif;
+  --font-mono:'JetBrains Mono','Fira Mono',monospace;
+  --transition:180ms cubic-bezier(0.16,1,0.3,1);
+  --space-1:.25rem;--space-2:.5rem;--space-3:.75rem;--space-4:1rem;
+  --space-5:1.25rem;--space-6:1.5rem;--space-8:2rem;
+  /* Zone colors */
+  --zone-prohibited:#e55353;--zone-prohibited-fill:rgba(229,83,83,0.18);
+  --zone-req-auth:#f0a500;--zone-req-auth-fill:rgba(240,165,0,0.18);
+  --zone-conditional:#3b82f6;--zone-conditional-fill:rgba(59,130,246,0.18);
+  --zone-prohibited-border:rgba(229,83,83,0.85);
+  --zone-req-auth-border:rgba(240,165,0,0.85);
+  --zone-conditional-border:rgba(59,130,246,0.85);
+  /* selected highlight */
+  --zone-selected-border:#fff;
+}
+[data-theme="dark"]{
+  --color-bg:#0f0e0d;--color-surface:#161513;--color-surface-2:#1c1b19;
+  --color-surface-offset:#1d1c1a;--color-surface-dynamic:#2d2c2a;
+  --color-divider:#262523;--color-border:#393836;
+  --color-text:#cdccca;--color-text-muted:#797876;--color-text-faint:#5a5957;
+  --color-text-inverse:#2b2a28;
+  --color-primary:#4f98a3;--color-primary-hover:#227f8b;
+  --color-primary-highlight:#313b3b;
+  --color-shadow:oklch(0 0 0 / 0.35);
+}
+/* ─── BASE ─── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+body{font-family:var(--font-body);background:var(--color-bg);color:var(--color-text);
+  height:100dvh;overflow:hidden;display:flex;flex-direction:column}
+button{cursor:pointer;background:none;border:none;color:inherit;font:inherit}
+a,button,[role="button"]{transition:color var(--transition),background var(--transition),
+  border-color var(--transition),box-shadow var(--transition),opacity var(--transition)}
+:focus-visible{outline:2px solid var(--color-primary);outline-offset:2px;border-radius:var(--radius-sm)}
+/* ─── APP SHELL ─── */
+#app{display:flex;flex-direction:column;height:100dvh}
+/* ─── HEADER ─── */
+#header{
+  display:flex;align-items:center;gap:var(--space-3);
+  padding:.6rem var(--space-4);
+  background:var(--color-surface);
+  border-bottom:1px solid var(--color-border);
+  z-index:1000;flex-shrink:0;
+  box-shadow:0 1px 8px var(--color-shadow);
+}
+#header .logo{display:flex;align-items:center;gap:var(--space-2);flex-shrink:0}
+#header .logo svg{color:var(--color-primary)}
+#header .logo-text{font-size:.9rem;font-weight:600;letter-spacing:-.01em;white-space:nowrap}
+#header .logo-sub{font-size:.7rem;color:var(--color-text-muted);font-weight:400;
+  font-family:var(--font-mono)}
+#header-center{flex:1;min-width:0;display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap}
+#search-wrap{position:relative;flex:1;max-width:340px;min-width:140px}
+#search-wrap svg{position:absolute;left:.55rem;top:50%;transform:translateY(-50%);
+  color:var(--color-text-faint);pointer-events:none}
+#search{width:100%;background:var(--color-surface-2);border:1px solid var(--color-border);
+  border-radius:var(--radius-lg);padding:.4rem .7rem .4rem 2rem;
+  font-size:.8rem;color:var(--color-text)}
+#search::placeholder{color:var(--color-text-faint)}
+#search:focus{outline:none;border-color:var(--color-primary);
+  box-shadow:0 0 0 3px var(--color-primary-highlight)}
+#header-actions{display:flex;align-items:center;gap:var(--space-2)}
+.icon-btn{
+  display:flex;align-items:center;justify-content:center;
+  width:34px;height:34px;border-radius:var(--radius-md);
+  color:var(--color-text-muted);
+}
+.icon-btn:hover{background:var(--color-surface-dynamic);color:var(--color-text)}
+#stats-bar{
+  display:flex;align-items:center;gap:var(--space-3);
+  font-size:.72rem;color:var(--color-text-muted);
+  border-left:1px solid var(--color-border);
+  padding-left:var(--space-3);
+  white-space:nowrap;
+}
+.stat-chip{display:flex;align-items:center;gap:.3rem}
+.stat-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+/* ─── MAIN LAYOUT ─── */
+#main{flex:1;display:flex;min-height:0;position:relative}
+/* ─── SIDEBAR ─── */
+#sidebar{
+  width:300px;flex-shrink:0;
+  background:var(--color-surface);
+  border-right:1px solid var(--color-border);
+  display:flex;flex-direction:column;
+  overflow:hidden;z-index:100;
+  transition:width var(--transition),opacity var(--transition);
+}
+#sidebar.collapsed{width:0;opacity:0;pointer-events:none}
+#sidebar-head{
+  padding:var(--space-3) var(--space-4);
+  border-bottom:1px solid var(--color-border);
+  flex-shrink:0;
+}
+#filter-row{display:flex;gap:var(--space-2);flex-wrap:wrap;margin-top:var(--space-2)}
+.filter-btn{
+  font-size:.7rem;font-weight:500;letter-spacing:.02em;
+  padding:.25rem .6rem;border-radius:var(--radius-full);
+  border:1px solid var(--color-border);
+  color:var(--color-text-muted);
+  transition:all var(--transition);
+}
+.filter-btn:hover{color:var(--color-text);background:var(--color-surface-dynamic)}
+.filter-btn.active{color:#fff;border-color:transparent}
+.filter-btn[data-f="ALL"].active{background:var(--color-primary)}
+.filter-btn[data-f="PROHIBITED"].active{background:var(--zone-prohibited)}
+.filter-btn[data-f="REQ_AUTHORISATION"].active{background:var(--zone-req-auth);color:#1a0f00}
+.filter-btn[data-f="CONDITIONAL"].active{background:var(--zone-conditional)}
+#zone-count{font-size:.7rem;color:var(--color-text-muted);margin-top:.4rem}
+#zone-list{flex:1;overflow-y:auto;padding:var(--space-2)}
+#zone-list::-webkit-scrollbar{width:4px}
+#zone-list::-webkit-scrollbar-track{background:transparent}
+#zone-list::-webkit-scrollbar-thumb{background:var(--color-border);border-radius:2px}
+.zone-item{
+  border-radius:var(--radius-md);padding:var(--space-3);
+  cursor:pointer;margin-bottom:var(--space-1);
+  border:1px solid transparent;
+  transition:all var(--transition);
+}
+.zone-item:hover{background:var(--color-surface-dynamic)}
+.zone-item.selected{
+  background:var(--color-surface-2);
+  border-color:var(--color-border);
+  box-shadow:0 1px 6px var(--color-shadow);
+}
+.zone-item-header{display:flex;align-items:flex-start;gap:var(--space-2)}
+.zone-badge{
+  font-size:.6rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  padding:.15rem .4rem;border-radius:var(--radius-sm);flex-shrink:0;margin-top:.1rem;
+  color:#fff;
+}
+.badge-PROHIBITED{background:var(--zone-prohibited)}
+.badge-REQ_AUTHORISATION{background:var(--zone-req-auth);color:#1a0f00}
+.badge-CONDITIONAL{background:var(--zone-conditional)}
+.zone-name{font-size:.82rem;font-weight:600;line-height:1.3}
+.zone-sub{font-size:.7rem;color:var(--color-text-muted);margin-top:.15rem}
+/* ─── MAP ─── */
+#map{flex:1;position:relative}
+.leaflet-container{background:#1a2535 !important}
+[data-theme="light"] .leaflet-container{background:#e8ecf0 !important}
+/* ─── PANEL ─── */
+#panel{
+  position:absolute;right:0;top:0;bottom:0;
+  width:360px;
+  background:var(--color-surface);
+  border-left:1px solid var(--color-border);
+  z-index:500;display:flex;flex-direction:column;
+  transform:translateX(100%);
+  transition:transform .25s cubic-bezier(0.16,1,0.3,1);
+  box-shadow:-4px 0 20px var(--color-shadow);
+}
+#panel.open{transform:translateX(0)}
+#panel-head{
+  padding:var(--space-4);border-bottom:1px solid var(--color-border);
+  display:flex;align-items:flex-start;gap:var(--space-3);flex-shrink:0;
+}
+#panel-title{font-size:1.05rem;font-weight:700;flex:1;line-height:1.3}
+#panel-close{color:var(--color-text-muted)}
+#panel-close:hover{color:var(--color-text)}
+#panel-body{flex:1;overflow-y:auto;padding:var(--space-4)}
+#panel-body::-webkit-scrollbar{width:4px}
+#panel-body::-webkit-scrollbar-thumb{background:var(--color-border);border-radius:2px}
+.info-section{margin-bottom:var(--space-5)}
+.info-section:last-child{margin-bottom:0}
+.info-section-title{
+  font-size:.65rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--color-text-faint);margin-bottom:var(--space-2);
+  display:flex;align-items:center;gap:var(--space-2);
+}
+.info-section-title::after{content:'';flex:1;height:1px;background:var(--color-divider)}
+.info-row{display:flex;gap:var(--space-3);margin-bottom:var(--space-2);align-items:baseline}
+.info-label{font-size:.7rem;color:var(--color-text-muted);width:110px;flex-shrink:0;padding-top:.08em}
+.info-value{font-size:.8rem;font-weight:500;flex:1;word-break:break-word}
+.info-value.mono{font-family:var(--font-mono);font-size:.75rem}
+.restriction-tag{
+  display:inline-flex;align-items:center;gap:.3rem;
+  font-size:.72rem;font-weight:700;letter-spacing:.04em;
+  padding:.25rem .65rem;border-radius:var(--radius-full);
+  color:#fff;
+}
+.restriction-tag.PROHIBITED{background:var(--zone-prohibited)}
+.restriction-tag.REQ_AUTHORISATION{background:var(--zone-req-auth);color:#1a0f00}
+.restriction-tag.CONDITIONAL{background:var(--zone-conditional)}
+.message-box{
+  background:var(--color-surface-offset);
+  border:1px solid var(--color-border);
+  border-radius:var(--radius-md);
+  padding:var(--space-3) var(--space-4);
+  font-size:.78rem;line-height:1.6;color:var(--color-text-muted);
+}
+.authority-card{
+  background:var(--color-surface-2);border:1px solid var(--color-border);
+  border-radius:var(--radius-md);padding:var(--space-3);
+  margin-bottom:var(--space-2);
+}
+.authority-card:last-child{margin-bottom:0}
+.authority-name{font-size:.8rem;font-weight:600}
+.authority-contact{font-size:.72rem;color:var(--color-text-muted);margin-top:.25rem;
+  display:flex;flex-direction:column;gap:.2rem}
+.authority-contact a{color:var(--color-primary);text-decoration:none}
+.authority-contact a:hover{text-decoration:underline}
+.purpose-badge{
+  font-size:.6rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  padding:.12rem .4rem;border-radius:var(--radius-sm);
+  background:var(--color-surface-dynamic);color:var(--color-text-muted);
+  display:inline-block;margin-bottom:.3rem;
+}
+.altitude-vis{
+  display:flex;align-items:flex-end;gap:.3rem;margin-top:.4rem;
+  height:56px;position:relative;
+}
+.alt-bar{
+  border-radius:3px 3px 0 0;
+  min-width:32px;
+  display:flex;align-items:flex-end;justify-content:center;
+  padding:.2rem;font-family:var(--font-mono);font-size:.62rem;color:#fff;
+  position:relative;
+}
+.alt-ground{font-size:.62rem;color:var(--color-text-faint);align-self:flex-end;margin-left:.2rem}
+.reason-tag{
+  display:inline-flex;align-items:center;gap:.25rem;
+  font-size:.68rem;padding:.15rem .5rem;border-radius:var(--radius-full);
+  background:var(--color-surface-dynamic);color:var(--color-text-muted);
+  margin:.15rem .15rem 0 0;border:1px solid var(--color-border);
+}
+/* ─── MAP LEGEND ─── */
+#legend{
+  position:absolute;bottom:var(--space-4);left:var(--space-4);
+  background:var(--color-surface);border:1px solid var(--color-border);
+  border-radius:var(--radius-lg);padding:var(--space-3) var(--space-4);
+  z-index:400;box-shadow:0 2px 12px var(--color-shadow);
+  min-width:160px;
+}
+#legend .legend-title{font-size:.65rem;font-weight:700;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--color-text-faint);margin-bottom:.5rem}
+.legend-row{display:flex;align-items:center;gap:.5rem;font-size:.72rem;
+  color:var(--color-text-muted);margin-bottom:.25rem}
+.legend-row:last-child{margin-bottom:0}
+.legend-swatch{width:14px;height:10px;border-radius:2px;flex-shrink:0}
+/* ─── TOAST ─── */
+#toast{
+  position:absolute;top:var(--space-4);left:50%;transform:translateX(-50%) translateY(-80px);
+  background:var(--color-surface);border:1px solid var(--color-border);
+  border-radius:var(--radius-lg);padding:.5rem var(--space-4);
+  font-size:.78rem;color:var(--color-text-muted);
+  box-shadow:0 4px 16px var(--color-shadow);
+  z-index:2000;pointer-events:none;
+  transition:transform .3s cubic-bezier(0.16,1,0.3,1),opacity .3s;
+  white-space:nowrap;
+}
+#toast.show{transform:translateX(-50%) translateY(0)}
+/* ─── SIDEBAR TOGGLE BTN ─── */
+#sidebar-toggle{
+  position:absolute;left:0;top:50%;transform:translateY(-50%);
+  z-index:200;background:var(--color-surface);
+  border:1px solid var(--color-border);border-left:none;
+  border-radius:0 var(--radius-md) var(--radius-md) 0;
+  padding:var(--space-3) .35rem;
+  color:var(--color-text-muted);
+  box-shadow:2px 0 8px var(--color-shadow);
+  transition:all var(--transition);
+  display:none;
+}
+/* ─── LOADING ─── */
+#loading{
+  position:absolute;inset:0;background:var(--color-bg);
+  display:flex;align-items:center;justify-content:center;
+  flex-direction:column;gap:var(--space-4);z-index:9999;
+}
+.spinner{
+  width:36px;height:36px;border:3px solid var(--color-border);
+  border-top-color:var(--color-primary);border-radius:50%;
+  animation:spin 0.8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loading p{font-size:.8rem;color:var(--color-text-muted)}
+/* ─── EMPTY LIST ─── */
+#zone-empty{
+  text-align:center;padding:var(--space-8) var(--space-4);
+  color:var(--color-text-faint);font-size:.8rem;display:none;
+}
+
+/* ─── CHECK-POINT MODE ─── */
+#check-btn{
+  display:flex;align-items:center;gap:.4rem;
+  font-size:.75rem;font-weight:600;
+  padding:.35rem .8rem;border-radius:var(--radius-full);
+  border:1.5px solid var(--color-border);
+  color:var(--color-text-muted);
+  background:var(--color-surface-2);
+  white-space:nowrap;
+  transition:all var(--transition);
+}
+#check-btn:hover{border-color:var(--color-primary);color:var(--color-primary)}
+#check-btn.active{
+  background:var(--color-primary);color:#fff;
+  border-color:var(--color-primary);
+}
+#check-btn svg{flex-shrink:0}
+body.check-mode #map{cursor:crosshair !important}
+body.check-mode .leaflet-interactive{cursor:crosshair !important}
+
+/* ─── GEOCODER ─── */
+#geo-wrap{position:relative;flex:1;max-width:240px;min-width:120px}
+#geo-wrap svg{position:absolute;left:.55rem;top:50%;transform:translateY(-50%);
+  color:var(--color-text-faint);pointer-events:none}
+#geocoder{width:100%;background:var(--color-surface-2);border:1px solid var(--color-border);
+  border-radius:var(--radius-lg);padding:.4rem .7rem .4rem 2rem;
+  font-size:.8rem;color:var(--color-text)}
+#geocoder::placeholder{color:var(--color-text-faint)}
+#geocoder:focus{outline:none;border-color:var(--color-primary);
+  box-shadow:0 0 0 3px var(--color-primary-highlight)}
+#geo-results{
+  position:absolute;top:calc(100% + 4px);left:0;right:0;
+  background:var(--color-surface);border:1px solid var(--color-border);
+  border-radius:var(--radius-lg);overflow:hidden;
+  box-shadow:0 4px 16px var(--color-shadow);
+  z-index:2000;max-height:220px;overflow-y:auto;
+  display:none;
+}
+#geo-results.open{display:block}
+.geo-result{
+  padding:.5rem var(--space-4);font-size:.78rem;cursor:pointer;
+  border-bottom:1px solid var(--color-divider);
+  transition:background var(--transition);
+}
+.geo-result:last-child{border-bottom:none}
+.geo-result:hover{background:var(--color-surface-dynamic)}
+.geo-result-name{font-weight:500}
+.geo-result-sub{font-size:.68rem;color:var(--color-text-muted);margin-top:.1rem}
+.geo-spinner{
+  width:14px;height:14px;border:2px solid var(--color-border);
+  border-top-color:var(--color-primary);border-radius:50%;
+  animation:spin 0.7s linear infinite;
+  position:absolute;right:.6rem;top:50%;transform:translateY(-50%);
+  display:none;
+}
+.geo-spinner.active{display:block}
+
+/* ─── POINT POPUP ─── */
+.check-popup .leaflet-popup-content-wrapper{
+  background:var(--color-surface);
+  border:1px solid var(--color-border);
+  border-radius:var(--radius-lg);
+  box-shadow:0 4px 20px var(--color-shadow);
+  color:var(--color-text);
+  padding:0;
+}
+.check-popup .leaflet-popup-content{margin:0;min-width:220px;max-width:300px}
+.check-popup .leaflet-popup-tip-container{display:none}
+.check-popup .leaflet-popup-close-button{
+  color:var(--color-text-muted)!important;
+  top:8px!important;right:10px!important;
+  font-size:18px!important;
+}
+.popup-inner{padding:var(--space-3) var(--space-4)}
+.popup-coords{
+  font-family:var(--font-mono);font-size:.65rem;color:var(--color-text-faint);
+  margin-bottom:.5rem;
+}
+.popup-title{font-size:.78rem;font-weight:700;margin-bottom:.5rem;
+  display:flex;align-items:center;gap:.4rem}
+.popup-zone-row{
+  display:flex;align-items:center;gap:.5rem;padding:.3rem 0;
+  border-top:1px solid var(--color-divider);cursor:pointer;
+  transition:opacity var(--transition);
+}
+.popup-zone-row:hover{opacity:.75}
+.popup-zone-row:first-of-type{border-top:none}
+.popup-zone-name{font-size:.78rem;font-weight:500;flex:1}
+.popup-zone-sub{font-size:.65rem;color:var(--color-text-muted)}
+.popup-none{font-size:.75rem;color:var(--color-text-muted);
+  padding:var(--space-2) 0;text-align:center}
+
+/* ─── PIN MARKER ─── */
+.pin-marker{
+  width:0;height:0;position:relative;
+}
+.pin-marker::before{
+  content:'';position:absolute;
+  width:14px;height:14px;
+  background:var(--color-primary);border:2.5px solid #fff;
+  border-radius:50%;
+  top:-7px;left:-7px;
+  box-shadow:0 1px 6px rgba(0,0,0,.4);
+}
+
+
+@keyframes pulse {
+  0%   { transform: scale(0.5); opacity: .4; }
+  100% { transform: scale(2);   opacity: 0; }
+}
+
+/* ─── SCROLLBAR GLOBAL ─── */
+*{scrollbar-width:thin;scrollbar-color:var(--color-border) transparent}
+/* ─── GEOM INFO ─── */
+.geom-row{
+  display:flex;gap:var(--space-2);margin-bottom:var(--space-2);align-items:flex-start;
+  background:var(--color-surface-2);border-radius:var(--radius-md);
+  padding:var(--space-2) var(--space-3);border:1px solid var(--color-border);
+}
+.geom-type{
+  font-size:.65rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  padding:.1rem .35rem;border-radius:var(--radius-sm);
+  background:var(--color-surface-dynamic);color:var(--color-text-muted);
+  flex-shrink:0;
+}
+.geom-detail{font-size:.72rem;color:var(--color-text-muted);font-family:var(--font-mono);line-height:1.6}
+/* ─── RESPONSIVE ─── */
+@media(max-width:640px){
+  #sidebar{position:absolute;height:100%;box-shadow:4px 0 20px var(--color-shadow)}
+  #sidebar.collapsed{width:0;opacity:0;pointer-events:none}
+  #sidebar-toggle{display:flex}
+  #panel{width:100%;min-width:0;border-left:none;border-top:1px solid var(--color-border)}
+  #stats-bar{display:none}
+  #header .logo-sub{display:none}
+}
+</style>
+</head>
+<body>
+<div id="app">
+<!-- HEADER -->
+<header id="header">
+  <div class="logo">
+    <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-label="BGR NFZ Logo">
+      <rect x="2" y="2" width="24" height="24" rx="5" stroke="currentColor" stroke-width="1.5" fill="none"/>
+      <circle cx="14" cy="14" r="6" stroke="currentColor" stroke-width="1.5" fill="none"/>
+      <line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="26" y1="2" x2="18" y2="10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="2" y1="26" x2="10" y2="18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="26" y1="26" x2="18" y2="18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <div class="logo-text">BGR No-Fly Zones</div>
+      <div class="logo-sub">ГД ГВА · 16-06-2026</div>
+    </div>
+  </div>
+
+  <div id="header-center">
+    <div id="search-wrap">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input id="search" type="text" placeholder="Търси зона (AEC, HAIL…)" autocomplete="off" spellcheck="false">
+    </div>
+    <div id="geo-wrap">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+      <input id="geocoder" type="text" placeholder="Търси адрес / място…" autocomplete="off" spellcheck="false">
+      <div class="geo-spinner" id="geo-spinner"></div>
+      <div id="geo-results"></div>
+    </div>
+    <button id="check-btn" title="Кликни точка и провери зони">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+      Провери точка
+    </button>
+    <div id="stats-bar">
+      <span class="stat-chip"><span class="stat-dot" style="background:var(--zone-prohibited)"></span><span id="stat-proh">–</span> забранени</span>
+      <span class="stat-chip"><span class="stat-dot" style="background:var(--zone-req-auth)"></span><span id="stat-auth">–</span> разрешение</span>
+      <span class="stat-chip"><span class="stat-dot" style="background:var(--zone-conditional)"></span><span id="stat-cond">–</span> условни</span>
+    </div>
+  </div>
+
+  <div id="header-actions">
+    <button class="icon-btn" id="toggle-sidebar" title="Покажи/скрий списъка" aria-label="Toggle sidebar">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+    </button>
+    <button class="icon-btn" data-theme-toggle aria-label="Toggle dark mode">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+  </div>
+</header>
+
+<!-- MAIN -->
+<div id="main">
+  <!-- SIDEBAR TOGGLE (mobile) -->
+  <button id="sidebar-toggle" aria-label="Show sidebar">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+  </button>
+
+  <!-- SIDEBAR -->
+  <aside id="sidebar">
+    <div id="sidebar-head">
+      <div id="filter-row">
+        <button class="filter-btn active" data-f="ALL">Всички</button>
+        <button class="filter-btn" data-f="PROHIBITED">Забранени</button>
+        <button class="filter-btn" data-f="REQ_AUTHORISATION">Разрешение</button>
+        <button class="filter-btn" data-f="CONDITIONAL">Условни</button>
+      </div>
+      <div id="zone-count"></div>
+    </div>
+    <div id="zone-list">
+      <div id="zone-empty">Няма намерени зони</div>
+    </div>
+  </aside>
+
+  <!-- MAP -->
+  <div id="map"></div>
+
+  <!-- DETAIL PANEL -->
+  <aside id="panel" role="complementary" aria-label="Zone details">
+    <div id="panel-head">
+      <div>
+        <div id="panel-title">–</div>
+        <div id="panel-subtitle" style="font-size:.72rem;color:var(--color-text-muted);margin-top:.2rem"></div>
+      </div>
+      <button class="icon-btn" id="panel-close" aria-label="Close panel">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div id="panel-body"></div>
+  </aside>
+
+  <!-- LEGEND -->
+  <div id="legend">
+    <div class="legend-title">Ограничения</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:var(--zone-prohibited);opacity:.8"></span>Забранена</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:var(--zone-req-auth);opacity:.8"></span>Изисква разрешение</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:var(--zone-conditional);opacity:.8"></span>Условна</div>
+  </div>
+
+  <!-- TOAST -->
+  <div id="toast"></div>
+
+  <!-- LOADING -->
+  <div id="loading">
+    <div class="spinner"></div>
+    <p>Зареждане на зоните…</p>
+  </div>
+</div>
+</div>
+
+<script>
+// ── EMBEDDED DATA LOADER ──────────────────────────────────────────────────────
+// We embed the JSON inline via a fetch of the attached file.
+// If running standalone, user must drop the JSON next to this file.
+// We try to load it, else prompt for file input.
+
+const RESTRICTION_LABELS = {
+  'PROHIBITED': 'Забранена',
+  'REQ_AUTHORISATION': 'Изисква разрешение',
+  'CONDITIONAL': 'Условна',
+};
+const REASON_LABELS = {
+  'SENSITIVE': 'Чувствителна',
+  'PRIVACY': 'Поверителност',
+  'AIR_TRAFFIC': 'Въздушен трафик',
+  'NATURE': 'Природа',
+  'FOREIGN_TERRITORY': 'Чужда територия',
+};
+const PURPOSE_LABELS = {
+  'INFORMATION': 'Информация',
+  'AUTHORIZATION': 'Оторизация',
+  'NOTIFICATION': 'Уведомление',
+};
+
+// Zone colors
+const ZONE_COLORS = {
+  PROHIBITED: { stroke: 'rgba(229,83,83,0.90)', fill: 'rgba(229,83,83,0.15)' },
+  REQ_AUTHORISATION: { stroke: 'rgba(240,165,0,0.90)', fill: 'rgba(240,165,0,0.15)' },
+  CONDITIONAL: { stroke: 'rgba(59,130,246,0.90)', fill: 'rgba(59,130,246,0.15)' },
+};
+
+// ── STATE ─────────────────────────────────────────────────────────────────────
+let allZones = [];
+let filteredZones = [];
+let selectedId = null;
+let activeFilter = 'ALL';
+let searchTerm = '';
+let map, layerGroup;
+let layerMap = {}; // id -> leaflet layer
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+(function init() {
+  // Dark mode toggle
+  const themeToggle = document.querySelector('[data-theme-toggle]');
+  const html = document.documentElement;
+  let theme = html.getAttribute('data-theme') || 'dark';
+  html.setAttribute('data-theme', theme);
+  updateThemeIcon(theme);
+  themeToggle.addEventListener('click', () => {
+    theme = theme === 'dark' ? 'light' : 'dark';
+    html.setAttribute('data-theme', theme);
+    updateThemeIcon(theme);
+    if (map) setTimeout(() => map.invalidateSize(), 50);
+  });
+
+  // Sidebar toggle
+  document.getElementById('toggle-sidebar').addEventListener('click', toggleSidebar);
+  document.getElementById('sidebar-toggle').addEventListener('click', () => {
+    document.getElementById('sidebar').classList.remove('collapsed');
+  });
+
+  // Panel close
+  document.getElementById('panel-close').addEventListener('click', closePanel);
+
+  // Search
+  document.getElementById('search').addEventListener('input', e => {
+    searchTerm = e.target.value.toLowerCase().trim();
+    applyFilters();
+  });
+
+  // Filter buttons
+  document.querySelectorAll('.filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      activeFilter = btn.dataset.f;
+      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      applyFilters();
+    });
+  });
+
+  // Init map
+  initMap();
+
+  // Load data
+  loadData();
+})();
+
+function updateThemeIcon(theme) {
+  const btn = document.querySelector('[data-theme-toggle]');
+  if (theme === 'dark') {
+    btn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>';
+    btn.setAttribute('aria-label', 'Switch to light mode');
+  } else {
+    btn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+    btn.setAttribute('aria-label', 'Switch to dark mode');
+  }
+}
+
+function toggleSidebar() {
+  const sb = document.getElementById('sidebar');
+  sb.classList.toggle('collapsed');
+  setTimeout(() => map && map.invalidateSize(), 300);
+}
+
+// ── MAP INIT ─────────────────────────────────────────────────────────────────
+function initMap() {
+  map = L.map('map', {
+    center: [42.7, 25.5],
+    zoom: 7,
+    zoomControl: false,
+    attributionControl: true,
+  });
+
+  // Tiles — dark/light handled via two tile layers
+  const darkTiles = L.tileLayer(
+    'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    { attribution: '© OpenStreetMap © CARTO', maxZoom: 19, subdomains: 'abcd', r: window.devicePixelRatio > 1 ? '@2x' : '' }
+  );
+  const lightTiles = L.tileLayer(
+    'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    { attribution: '© OpenStreetMap © CARTO', maxZoom: 19, subdomains: 'abcd', r: window.devicePixelRatio > 1 ? '@2x' : '' }
+  );
+
+  const isDark = () => document.documentElement.getAttribute('data-theme') === 'dark';
+  let currentTile = isDark() ? darkTiles : lightTiles;
+  currentTile.addTo(map);
+
+  // Listen for theme changes to swap tiles
+  const observer = new MutationObserver(() => {
+    const wantDark = isDark();
+    if (wantDark && map.hasLayer(lightTiles)) { map.removeLayer(lightTiles); darkTiles.addTo(map); }
+    else if (!wantDark && map.hasLayer(darkTiles)) { map.removeLayer(darkTiles); lightTiles.addTo(map); }
+  });
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+  L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+  layerGroup = L.layerGroup().addTo(map);
+
+  // Smart click: pick smallest zone under cursor, else deselect
+  map.on('click', (e) => {
+    const point = e.latlng;
+    let best = null;
+    let bestArea = Infinity;
+
+    allZones.forEach(zone => {
+      if (!(layerMap[zone.identifier])) return;
+      // only consider visible layers
+      const layers = layerMap[zone.identifier].filter(l => layerGroup.hasLayer(l));
+      if (!layers.length) return;
+      layers.forEach(l => {
+        if (!zoneContainsPoint(zone, point)) return;
+        const area = getZoneArea(zone);
+        if (area < bestArea) { bestArea = area; best = zone.identifier; }
+      });
+    });
+
+    if (best) {
+      selectZone(best);
+    } else {
+      deselectZone();
+    }
+  });
+}
+
+// ── DATA LOADING ─────────────────────────────────────────────────────────────
+function loadData() {
+  // Try to fetch from same directory
+  fetch('./bgr_zones_16062026.json')
+    .then(r => {
+      if (!r.ok) throw new Error('not found');
+      return r.json();
+    })
+    .then(data => processData(data))
+    .catch(() => {
+      // Show file picker fallback
+      showFilePicker();
+    });
+}
+
+function showFilePicker() {
+  const loading = document.getElementById('loading');
+  loading.innerHTML = `
+    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--color-primary)" stroke-width="1.5">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+      <polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/>
+      <line x1="9" y1="15" x2="15" y2="15"/>
+    </svg>
+    <p style="margin-top:.5rem">Зареди <code style="font-family:var(--font-mono);color:var(--color-primary)">bgr_zones_16062026.json</code></p>
+    <label style="
+      display:inline-flex;align-items:center;gap:.5rem;cursor:pointer;margin-top:.75rem;
+      background:var(--color-primary);color:#fff;padding:.5rem 1.2rem;
+      border-radius:var(--radius-full);font-size:.82rem;font-weight:600;
+      transition:background var(--transition);
+    " id="file-label">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
+        <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
+      </svg>
+      Избери файл
+      <input type="file" accept=".json" id="file-input" style="display:none">
+    </label>
+    <p style="font-size:.7rem;margin-top:.5rem;opacity:.6">или постави файла до viewer-а и презареди</p>
+  `;
+  document.getElementById('file-input').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        processData(data);
+      } catch {
+        showToast('Невалиден JSON файл');
+      }
+    };
+    reader.readAsText(file, 'utf-8');
+  });
+}
+
+function processData(data) {
+  allZones = data.features || [];
+  document.getElementById('loading').style.display = 'none';
+
+  // Stats
+  const proh = allZones.filter(z => z.restriction === 'PROHIBITED').length;
+  const auth = allZones.filter(z => z.restriction === 'REQ_AUTHORISATION').length;
+  const cond = allZones.filter(z => z.restriction === 'CONDITIONAL').length;
+  document.getElementById('stat-proh').textContent = proh;
+  document.getElementById('stat-auth').textContent = auth;
+  document.getElementById('stat-cond').textContent = cond;
+
+  renderAllLayers();
+  applyFilters();
+  locateUser();
+}
+
+function locateUser() {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      const latlng = L.latLng(lat, lng);
+
+      // Remove old geo marker if any
+      if (geoMarker) { geoMarker.remove(); geoMarker = null; }
+
+      const icon = L.divIcon({
+        className: '',
+        html: `<div style="width:0;height:0;position:relative">
+          <div style="position:absolute;width:16px;height:16px;
+            background:var(--color-primary);border:2.5px solid #fff;border-radius:50%;
+            top:-8px;left:-8px;box-shadow:0 1px 8px rgba(0,0,0,.5)"></div>
+          <div style="position:absolute;width:36px;height:36px;
+            background:var(--color-primary);opacity:.15;border-radius:50%;
+            top:-18px;left:-18px;animation:pulse 2s ease-out infinite"></div>
+        </div>`,
+        iconSize: [0,0], iconAnchor: [0,0],
+      });
+      geoMarker = L.marker([lat, lng], { icon, zIndexOffset: 2000 }).addTo(map);
+
+      // Pan to location but don't zoom too close — keep context
+      map.setView([lat, lng], 12);
+
+      // Check zones
+      const hits = allZones.filter(z =>
+        (layerMap[z.identifier]||[]).some(l => layerGroup.hasLayer(l)) &&
+        zoneContainsPoint(z, latlng)
+      );
+      if (hits.length) {
+        showToast(`Твоята локация · ${hits.length} зона${hits.length!==1?'и':''} ⚠`);
+      } else {
+        showToast('Твоята локация · Без ограничения ✓');
+      }
+    },
+    () => {} // silently ignore denial
+  );
+}
+
+// ── LAYERS ────────────────────────────────────────────────────────────────────
+function renderAllLayers() {
+  layerGroup.clearLayers();
+  layerMap = {};
+
+  allZones.forEach(zone => {
+    const colors = ZONE_COLORS[zone.restriction] || ZONE_COLORS['CONDITIONAL'];
+    (zone.geometry || []).forEach(geo => {
+      const proj = geo.horizontalProjection;
+      if (!proj) return;
+      let layer;
+      if (proj.type === 'Circle') {
+        const [lng, lat] = proj.center;
+        layer = L.circle([lat, lng], {
+          radius: proj.radius,
+          color: colors.stroke,
+          fillColor: colors.fill,
+          fillOpacity: 1,
+          weight: 1.5,
+        });
+      } else if (proj.type === 'Polygon') {
+        const coords = proj.coordinates[0].map(([lng, lat]) => [lat, lng]);
+        layer = L.polygon(coords, {
+          color: colors.stroke,
+          fillColor: colors.fill,
+          fillOpacity: 1,
+          weight: 1.5,
+        });
+      }
+      if (layer) {
+        layer.on('mouseover', () => {
+          if (selectedId !== zone.identifier) {
+            layer.setStyle({ weight: 2.5, fillOpacity: 1 });
+          }
+          showToast(zone.name + ' · ' + (RESTRICTION_LABELS[zone.restriction] || zone.restriction));
+        });
+        layer.on('mouseout', () => {
+          if (selectedId !== zone.identifier) {
+            layer.setStyle({ weight: 1.5, fillOpacity: 1 });
+          }
+        });
+        layerGroup.addLayer(layer);
+        if (!layerMap[zone.identifier]) layerMap[zone.identifier] = [];
+        layerMap[zone.identifier].push(layer);
+      }
+    });
+  });
+}
+
+// ── FILTERS & LIST ────────────────────────────────────────────────────────────
+function applyFilters() {
+  filteredZones = allZones.filter(z => {
+    if (activeFilter !== 'ALL' && z.restriction !== activeFilter) return false;
+    if (searchTerm) {
+      const haystack = (z.name + ' ' + z.identifier + ' ' + (z.message||'') + ' ' + (z.otherReasonInfo||'')).toLowerCase();
+      if (!haystack.includes(searchTerm)) return false;
+    }
+    return true;
+  });
+
+  // Show/hide layers
+  const visibleIds = new Set(filteredZones.map(z => z.identifier));
+  Object.entries(layerMap).forEach(([id, layers]) => {
+    layers.forEach(l => {
+      if (visibleIds.has(id)) {
+        if (!layerGroup.hasLayer(l)) layerGroup.addLayer(l);
+      } else {
+        if (layerGroup.hasLayer(l)) layerGroup.removeLayer(l);
+      }
+    });
+  });
+
+  renderList();
+}
+
+function renderList() {
+  const list = document.getElementById('zone-list');
+  const empty = document.getElementById('zone-empty');
+  const countEl = document.getElementById('zone-count');
+
+  // Remove old items
+  list.querySelectorAll('.zone-item').forEach(el => el.remove());
+
+  countEl.textContent = filteredZones.length + ' от ' + allZones.length + ' зони';
+
+  if (filteredZones.length === 0) {
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+
+  const frag = document.createDocumentFragment();
+  filteredZones.forEach(zone => {
+    const item = document.createElement('div');
+    item.className = 'zone-item' + (zone.identifier === selectedId ? ' selected' : '');
+    item.dataset.id = zone.identifier;
+
+    const perm = (zone.applicability || []).some(a => a.permanent === 'YES');
+    const geom = (zone.geometry || [])[0] || {};
+    const geo = geom.horizontalProjection || {};
+    const geoInfo = geo.type === 'Circle'
+      ? `Кръг · R=${geo.radius}m`
+      : `Полигон`;
+    const alt = geom.lowerLimit !== undefined
+      ? `${geom.lowerLimit}–${geom.upperLimit}m ${geom.upperVerticalReference || ''}`
+      : '';
+
+    item.innerHTML = `
+      <div class="zone-item-header">
+        <span class="zone-badge badge-${zone.restriction}">${RESTRICTION_LABELS[zone.restriction] || zone.restriction}</span>
+        <div>
+          <div class="zone-name">${zone.name}</div>
+          <div class="zone-sub">#${zone.identifier} · ${geoInfo}${alt ? ' · ' + alt : ''}</div>
+        </div>
+      </div>
+    `;
+    item.addEventListener('click', () => selectZone(zone.identifier));
+    frag.appendChild(item);
+  });
+  list.appendChild(frag);
+}
+
+// ── SELECT ZONE ───────────────────────────────────────────────────────────────
+function selectZone(id) {
+  if (selectedId) deselectZoneStyle(selectedId);
+  selectedId = id;
+
+  // Update list selection
+  document.querySelectorAll('.zone-item').forEach(el => {
+    el.classList.toggle('selected', el.dataset.id === id);
+  });
+
+  // Highlight on map
+  highlightZone(id);
+
+  // Scroll list item into view
+  const listItem = document.querySelector(`.zone-item[data-id="${id}"]`);
+  if (listItem) listItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+
+  // Open panel
+  const zone = allZones.find(z => z.identifier === id);
+  if (zone) openPanel(zone);
+
+  // Fly to zone
+  flyToZone(zone);
+}
+
+function deselectZone() {
+  if (selectedId) deselectZoneStyle(selectedId);
+  selectedId = null;
+  document.querySelectorAll('.zone-item').forEach(el => el.classList.remove('selected'));
+  closePanel();
+}
+
+function deselectZoneStyle(id) {
+  const zone = allZones.find(z => z.identifier === id);
+  if (!zone) return;
+  const colors = ZONE_COLORS[zone.restriction] || ZONE_COLORS['CONDITIONAL'];
+  (layerMap[id] || []).forEach(l => {
+    l.setStyle({ color: colors.stroke, weight: 1.5, fillColor: colors.fill });
+  });
+}
+
+function highlightZone(id) {
+  const zone = allZones.find(z => z.identifier === id);
+  if (!zone) return;
+  (layerMap[id] || []).forEach(l => {
+    l.setStyle({ color: '#ffffff', weight: 2.5, fillColor: (ZONE_COLORS[zone.restriction] || ZONE_COLORS['CONDITIONAL']).fill });
+    l.bringToFront();
+  });
+}
+
+function flyToZone(zone) {
+  if (!zone || !zone.geometry) return;
+  const geo = zone.geometry[0]?.horizontalProjection;
+  if (!geo) return;
+  if (geo.type === 'Circle') {
+    const [lng, lat] = geo.center;
+    const r = geo.radius;
+    const bounds = L.circle([lat, lng], { radius: r }).getBounds();
+    map.fitBounds(bounds, { padding: [60, 60], maxZoom: 14 });
+  } else if (geo.type === 'Polygon') {
+    const coords = geo.coordinates[0].map(([lng, lat]) => [lat, lng]);
+    const bounds = L.polygon(coords).getBounds();
+    map.fitBounds(bounds, { padding: [60, 60], maxZoom: 14 });
+  }
+}
+
+// ── PANEL ─────────────────────────────────────────────────────────────────────
+function openPanel(zone) {
+  document.getElementById('panel-title').textContent = zone.name;
+  document.getElementById('panel-subtitle').textContent = '#' + zone.identifier + ' · ' + zone.country;
+  document.getElementById('panel-body').innerHTML = buildPanelHTML(zone);
+  document.getElementById('panel').classList.add('open');
+}
+
+function closePanel() {
+  document.getElementById('panel').classList.remove('open');
+  if (selectedId) deselectZoneStyle(selectedId);
+  selectedId = null;
+  document.querySelectorAll('.zone-item').forEach(el => el.classList.remove('selected'));
+}
+
+function buildPanelHTML(zone) {
+  let html = '';
+
+  // Restriction + Reasons
+  html += `<div class="info-section">`;
+  html += `<div class="info-section-title">Ограничение</div>`;
+  html += `<div style="margin-bottom:.6rem">
+    <span class="restriction-tag ${zone.restriction}">${RESTRICTION_LABELS[zone.restriction] || zone.restriction}</span>
+  </div>`;
+
+  if (zone.reason && zone.reason.length) {
+    html += `<div style="display:flex;flex-wrap:wrap;gap:0">`;
+    zone.reason.forEach(r => {
+      html += `<span class="reason-tag">${REASON_LABELS[r] || r}</span>`;
+    });
+    html += `</div>`;
+  }
+  if (zone.otherReasonInfo) {
+    html += `<div class="info-row" style="margin-top:.5rem">
+      <span class="info-label">Друго</span>
+      <span class="info-value">${escapeHtml(zone.otherReasonInfo)}</span>
+    </div>`;
+  }
+  html += `</div>`;
+
+  // Message
+  if (zone.message) {
+    html += `<div class="info-section">`;
+    html += `<div class="info-section-title">Съобщение</div>`;
+    html += `<div class="message-box">${escapeHtml(zone.message)}</div>`;
+    html += `</div>`;
+  }
+
+  // Applicability
+  if (zone.applicability && zone.applicability.length) {
+    html += `<div class="info-section">`;
+    html += `<div class="info-section-title">Приложимост</div>`;
+    zone.applicability.forEach(a => {
+      html += `<div class="info-row">
+        <span class="info-label">Постоянна</span>
+        <span class="info-value">${a.permanent === 'YES' ? 'Да' : 'Не'}</span>
+      </div>`;
+      if (a.startDateTime) {
+        html += `<div class="info-row">
+          <span class="info-label">Начало</span>
+          <span class="info-value mono">${formatDate(a.startDateTime)}</span>
+        </div>`;
+      }
+      if (a.endDateTime) {
+        html += `<div class="info-row">
+          <span class="info-label">Край</span>
+          <span class="info-value mono">${formatDate(a.endDateTime)}</span>
+        </div>`;
+      }
+    });
+    html += `</div>`;
+  }
+
+  // Geometry
+  if (zone.geometry && zone.geometry.length) {
+    html += `<div class="info-section">`;
+    html += `<div class="info-section-title">Геометрия</div>`;
+    zone.geometry.forEach(g => {
+      const proj = g.horizontalProjection || {};
+      html += `<div class="geom-row">
+        <div>
+          <span class="geom-type">${proj.type || '–'}</span>
+          <div class="geom-detail">`;
+      if (proj.type === 'Circle') {
+        html += `Център: ${proj.center[1].toFixed(6)}°N, ${proj.center[0].toFixed(6)}°E<br>
+                 Радиус: ${proj.radius} m`;
+      } else if (proj.type === 'Polygon') {
+        html += `${proj.coordinates[0].length - 1} точки`;
+      }
+      html += `</div>`;
+      // Altitude bar
+      const lower = g.lowerLimit ?? 0;
+      const upper = g.upperLimit ?? 120;
+      const maxH = 120;
+      const barH = Math.min(48, Math.max(10, Math.round((upper / (maxH || 120)) * 48)));
+      html += `
+        <div style="margin-top:.4rem;display:flex;align-items:flex-end;gap:.4rem">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:.15rem">
+            <span style="font-family:var(--font-mono);font-size:.62rem;color:var(--color-text-muted)">${upper}m</span>
+            <div style="width:22px;height:${barH}px;background:var(--color-primary);border-radius:3px 3px 0 0;opacity:.75"></div>
+            <div style="width:22px;height:3px;background:var(--color-border)"></div>
+            <span style="font-family:var(--font-mono);font-size:.62rem;color:var(--color-text-faint)">${lower}m</span>
+          </div>
+          <span style="font-size:.65rem;color:var(--color-text-faint)">${g.lowerVerticalReference || 'AGL'}<br>→<br>${g.upperVerticalReference || 'AGL'}</span>
+        </div>`;
+      html += `</div></div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Zone Authority
+  if (zone.zoneAuthority && zone.zoneAuthority.length) {
+    html += `<div class="info-section">`;
+    html += `<div class="info-section-title">Орган</div>`;
+    zone.zoneAuthority.forEach(auth => {
+      html += `<div class="authority-card">
+        <span class="purpose-badge">${PURPOSE_LABELS[auth.purpose] || auth.purpose}</span>
+        <div class="authority-name">${escapeHtml(auth.name || '–')}</div>
+        <div class="authority-contact">`;
+      if (auth.contactName) html += `<span>${escapeHtml(auth.contactName)}</span>`;
+      if (auth.email) html += `<a href="mailto:${escapeHtml(auth.email)}" target="_blank" rel="noopener">${escapeHtml(auth.email)}</a>`;
+      if (auth.phone) html += `<a href="tel:${escapeHtml(auth.phone)}">${escapeHtml(auth.phone)}</a>`;
+      if (auth.intervalBefore) {
+        const readable = formatISO8601Duration(auth.intervalBefore);
+        html += `<span>Предварително: ${readable}</span>`;
+      }
+      html += `</div></div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Other info
+  html += `<div class="info-section">`;
+  html += `<div class="info-section-title">Допълнително</div>`;
+  html += `<div class="info-row"><span class="info-label">Тип зона</span><span class="info-value">${zone.type || '–'}</span></div>`;
+  html += `<div class="info-row"><span class="info-label">uSpace клас</span><span class="info-value">${zone.uSpaceClass || '–'}</span></div>`;
+  html += `<div class="info-row"><span class="info-label">Изкл. от рег.</span><span class="info-value">${zone.regulationExemption === 'YES' ? 'Да' : 'Не'}</span></div>`;
+  html += `</div>`;
+
+  return html;
+}
+
+// ── TOAST ─────────────────────────────────────────────────────────────────────
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+// ── HELPERS ──────────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function formatDate(iso) {
+  if (!iso) return '–';
+  try {
+    return new Date(iso).toLocaleDateString('bg-BG', { year:'numeric', month:'short', day:'numeric' });
+  } catch { return iso; }
+}
+
+function formatISO8601Duration(dur) {
+  if (!dur) return '–';
+  // P07DT00H00M → 7 дни
+  const dayMatch = dur.match(/P(\d+)D/);
+  const hrMatch = dur.match(/T(\d+)H/);
+  const minMatch = dur.match(/(\d+)M$/);
+  const monthMatch = dur.match(/P(\d+)M/i);
+  let parts = [];
+  if (monthMatch && !dayMatch) parts.push(monthMatch[1] + ' месец/а');
+  if (dayMatch) {
+    const d = parseInt(dayMatch[1]);
+    if (d) parts.push(d + ' ' + (d === 1 ? 'ден' : 'дни'));
+  }
+  if (hrMatch) { const h = parseInt(hrMatch[1]); if (h) parts.push(h + ' ч'); }
+  if (minMatch) { const m = parseInt(minMatch[1]); if (m) parts.push(m + ' мин'); }
+  return parts.length ? parts.join(' ') : dur;
+}
+
+// ── POINT-IN-ZONE & AREA HELPERS ─────────────────────────────────────────────
+function zoneContainsPoint(zone, latlng) {
+  const geo = (zone.geometry || [])[0]?.horizontalProjection;
+  if (!geo) return false;
+  if (geo.type === 'Circle') {
+    const [lng, lat] = geo.center;
+    const d = map.distance(latlng, L.latLng(lat, lng));
+    return d <= geo.radius;
+  } else if (geo.type === 'Polygon') {
+    // Ray-casting on the first ring
+    const ring = geo.coordinates[0];
+    return pointInPolygon([latlng.lng, latlng.lat], ring);
+  }
+  return false;
+}
+
+function pointInPolygon(point, ring) {
+  let inside = false;
+  const [px, py] = point;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    const intersect = ((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function getZoneArea(zone) {
+  const geo = (zone.geometry || [])[0]?.horizontalProjection;
+  if (!geo) return Infinity;
+  if (geo.type === 'Circle') return Math.PI * geo.radius * geo.radius;
+  if (geo.type === 'Polygon') {
+    // Shoelace on raw coordinates (proportional, good enough for comparison)
+    const ring = geo.coordinates[0];
+    let area = 0;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      area += (ring[j][0] + ring[i][0]) * (ring[j][1] - ring[i][1]);
+    }
+    return Math.abs(area / 2) * 1e10; // scale to compare with circle m²
+  }
+  return Infinity;
+}
+
+
+// ── CHECK-POINT MODE ─────────────────────────────────────────────────────────
+let checkMode = false;
+let checkMarker = null;
+let checkPopup = null;
+
+document.getElementById('check-btn').addEventListener('click', () => {
+  checkMode = !checkMode;
+  document.getElementById('check-btn').classList.toggle('active', checkMode);
+  document.body.classList.toggle('check-mode', checkMode);
+  if (!checkMode && checkMarker) {
+    checkMarker.remove(); checkMarker = null;
+    if (checkPopup) { checkPopup.remove(); checkPopup = null; }
+  }
+});
+
+// Override map click to support check mode
+const _origMapClick = map._events?.click;
+
+map.on('click', (e) => {
+  if (!checkMode) return; // handled by existing handler when not in check mode
+  placeCheckPoint(e.latlng);
+});
+
+// We need to patch the existing click handler to be mode-aware
+// Re-register: remove all, add smart one
+map.off('click');
+map.on('click', (e) => {
+  if (checkMode) {
+    placeCheckPoint(e.latlng);
+    return;
+  }
+  // original zone-picking logic
+  const point = e.latlng;
+  let best = null;
+  let bestArea = Infinity;
+  allZones.forEach(zone => {
+    if (!layerMap[zone.identifier]) return;
+    const layers = layerMap[zone.identifier].filter(l => layerGroup.hasLayer(l));
+    if (!layers.length) return;
+    if (!zoneContainsPoint(zone, point)) return;
+    const area = getZoneArea(zone);
+    if (area < bestArea) { bestArea = area; best = zone.identifier; }
+  });
+  if (best) { selectZone(best); } else { deselectZone(); }
+});
+
+function placeCheckPoint(latlng) {
+  // Remove old
+  if (checkMarker) { checkMarker.remove(); checkMarker = null; }
+  if (checkPopup) { checkPopup.remove(); checkPopup = null; }
+
+  // Pin marker
+  const icon = L.divIcon({
+    className: '',
+    html: '<div class="pin-marker"></div>',
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+  checkMarker = L.marker(latlng, { icon, zIndexOffset: 1000 }).addTo(map);
+
+  // Find zones containing point
+  const hits = [];
+  allZones.forEach(zone => {
+    if (!zoneContainsPoint(zone, latlng)) return;
+    // Only visible (filtered)
+    const layers = (layerMap[zone.identifier] || []).filter(l => layerGroup.hasLayer(l));
+    if (!layers.length) return;
+    hits.push(zone);
+  });
+
+  // Sort by area ascending (smallest first)
+  hits.sort((a, b) => getZoneArea(a) - getZoneArea(b));
+
+  // Build popup HTML
+  const lat = latlng.lat.toFixed(6);
+  const lng = latlng.lng.toFixed(6);
+  let inner = `<div class="popup-inner">`;
+  inner += `<div class="popup-coords">${lat}°N, ${lng}°E</div>`;
+
+  if (hits.length === 0) {
+    inner += `<div class="popup-none">✓ Без ограничения</div>`;
+  } else {
+    inner += `<div class="popup-title">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+        <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+      </svg>
+      ${hits.length} зона${hits.length !== 1 ? 'и' : ''}</div>`;
+    hits.forEach(zone => {
+      const colors = { PROHIBITED:'var(--zone-prohibited)', REQ_AUTHORISATION:'var(--zone-req-auth)', CONDITIONAL:'var(--zone-conditional)' };
+      const col = colors[zone.restriction] || 'var(--color-text-muted)';
+      const geo = (zone.geometry||[])[0]?.horizontalProjection;
+      const geoStr = geo?.type === 'Circle' ? `R=${geo.radius}m` : 'Полигон';
+      inner += `<div class="popup-zone-row" data-zone-id="${zone.identifier}">
+        <span style="width:8px;height:8px;border-radius:50%;background:${col};flex-shrink:0;display:inline-block"></span>
+        <div>
+          <div class="popup-zone-name">${zone.name}</div>
+          <div class="popup-zone-sub">${RESTRICTION_LABELS[zone.restriction]||zone.restriction} · ${geoStr}</div>
+        </div>
+      </div>`;
+    });
+  }
+  inner += `</div>`;
+
+  checkPopup = L.popup({
+    className: 'check-popup',
+    closeButton: true,
+    autoClose: false,
+    closeOnClick: false,
+    offset: [8, -4],
+    maxWidth: 320,
+  })
+  .setLatLng(latlng)
+  .setContent(inner)
+  .addTo(map);
+
+  // Bind click on zone rows after popup opens
+  checkPopup.on('add', () => {
+    document.querySelectorAll('.popup-zone-row[data-zone-id]').forEach(row => {
+      row.addEventListener('click', () => {
+        const id = row.dataset.zoneId;
+        if (id) {
+          checkMode = false;
+          document.getElementById('check-btn').classList.remove('active');
+          document.body.classList.remove('check-mode');
+          selectZone(id);
+          checkPopup.remove(); checkPopup = null;
+          checkMarker.remove(); checkMarker = null;
+        }
+      });
+    });
+  });
+}
+
+// ── GEOCODER ─────────────────────────────────────────────────────────────────
+let geoDebounce;
+let geoMarker = null;
+
+const geocoderInput = document.getElementById('geocoder');
+const geoResults = document.getElementById('geo-results');
+const geoSpinner = document.getElementById('geo-spinner');
+
+geocoderInput.addEventListener('input', () => {
+  clearTimeout(geoDebounce);
+  const q = geocoderInput.value.trim();
+  if (q.length < 3) { geoResults.classList.remove('open'); return; }
+  geoDebounce = setTimeout(() => geocodeSearch(q), 350);
+});
+
+geocoderInput.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { geoResults.classList.remove('open'); geocoderInput.blur(); }
+});
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#geo-wrap')) geoResults.classList.remove('open');
+});
+
+async function geocodeSearch(query) {
+  geoSpinner.classList.add('active');
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=6&countrycodes=bg&accept-language=bg`;
+    const res = await fetch(url, { headers: { 'Accept-Language': 'bg' } });
+    const data = await res.json();
+    renderGeoResults(data);
+  } catch {
+    geoResults.innerHTML = '<div class="geo-result"><div class="geo-result-name" style="color:var(--color-text-muted)">Грешка при търсене</div></div>';
+    geoResults.classList.add('open');
+  }
+  geoSpinner.classList.remove('active');
+}
+
+function renderGeoResults(data) {
+  geoResults.innerHTML = '';
+  if (!data.length) {
+    geoResults.innerHTML = '<div class="geo-result"><div class="geo-result-name" style="color:var(--color-text-muted)">Няма резултати</div></div>';
+    geoResults.classList.add('open');
+    return;
+  }
+  data.forEach(item => {
+    const div = document.createElement('div');
+    div.className = 'geo-result';
+    const parts = item.display_name.split(',');
+    const name = parts[0].trim();
+    const sub = parts.slice(1, 3).join(',').trim();
+    div.innerHTML = `<div class="geo-result-name">${escapeHtml(name)}</div>
+      <div class="geo-result-sub">${escapeHtml(sub)}</div>`;
+    div.addEventListener('click', () => {
+      geoResults.classList.remove('open');
+      geocoderInput.value = name;
+      flyToGeoResult(item);
+    });
+    geoResults.appendChild(div);
+  });
+  geoResults.classList.add('open');
+}
+
+function flyToGeoResult(item) {
+  const lat = parseFloat(item.lat);
+  const lng = parseFloat(item.lon);
+  const bb = item.boundingbox;
+
+  // Remove old geo marker
+  if (geoMarker) { geoMarker.remove(); geoMarker = null; }
+
+  // Place marker
+  const icon = L.divIcon({
+    className: '',
+    html: `<div style="width:0;height:0;position:relative">
+      <div style="position:absolute;width:16px;height:16px;background:var(--color-primary);
+        border:2.5px solid #fff;border-radius:50%;top:-8px;left:-8px;
+        box-shadow:0 1px 8px rgba(0,0,0,.5)"></div>
+    </div>`,
+    iconSize: [0, 0], iconAnchor: [0, 0],
+  });
+  geoMarker = L.marker([lat, lng], { icon, zIndexOffset: 2000 }).addTo(map);
+
+  // Fly to bounding box or just zoom to point
+  if (bb) {
+    map.fitBounds([[parseFloat(bb[0]), parseFloat(bb[2])],[parseFloat(bb[1]), parseFloat(bb[3])]],
+      { padding: [40, 40], maxZoom: 15 });
+  } else {
+    map.setView([lat, lng], 14);
+  }
+
+  // Check zones at this point
+  const latlng = L.latLng(lat, lng);
+  const hits = allZones.filter(z =>
+    (layerMap[z.identifier]||[]).some(l => layerGroup.hasLayer(l)) &&
+    zoneContainsPoint(z, latlng)
+  );
+  if (hits.length) {
+    showToast(`${item.display_name.split(',')[0]} · ${hits.length} зона${hits.length!==1?'и':''} ⚠`);
+  } else {
+    showToast(`${item.display_name.split(',')[0]} · Без ограничения`);
+  }
+}
+
+</script>
+</body>
+</html>
