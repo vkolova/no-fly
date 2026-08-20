@@ -1053,7 +1053,7 @@ function initMap() {
 // ── DATA LOADING ─────────────────────────────────────────────────────────────
 function loadData() {
   // Try to fetch from same directory
-  fetch('./bgr_zones_16062026.json')
+  fetch('./bgr_zones_30072026.json')
     .then(r => {
       if (!r.ok) throw new Error('not found');
       return r.json();
@@ -1073,7 +1073,7 @@ function showFilePicker() {
       <polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/>
       <line x1="9" y1="15" x2="15" y2="15"/>
     </svg>
-    <p style="margin-top:.5rem">Зареди <code style="font-family:var(--font-mono);color:var(--color-primary)">bgr_zones_16062026.json</code></p>
+    <p style="margin-top:.5rem">Зареди <code style="font-family:var(--font-mono);color:var(--color-primary)">bgr_zones_30072026.json</code></p>
     <label style="
       display:inline-flex;align-items:center;gap:.5rem;cursor:pointer;margin-top:.75rem;
       background:var(--color-primary);color:#fff;padding:.5rem 1.2rem;
